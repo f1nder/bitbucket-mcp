@@ -99,6 +99,8 @@ Configure the server using the following environment variables:
 | `BITBUCKET_USERNAME`         | Your Bitbucket username                                                        | Yes\*    |
 | `BITBUCKET_PASSWORD`         | Your Bitbucket app password                                                    | Yes\*    |
 | `BITBUCKET_TOKEN`            | Your Bitbucket access token (alternative to username/password)                 | No       |
+| `BITBUCKET_AUTH_MODE`        | Force auth mode: `basic` or `token`. Default prefers token when present.      | No       |
+| `BITBUCKET_PREFER_BASIC`     | Set to `true` to prefer basic auth when both token and username/password exist | No       |
 | `BITBUCKET_WORKSPACE`        | Default workspace to use. If omitted and `BITBUCKET_URL` contains it, auto-set | No       |
 | `BITBUCKET_ENABLE_DANGEROUS` | Set to `true` to enable dangerous tools (e.g., deletions). Default: disabled   | No       |
 | `BITBUCKET_LOG_DISABLE`      | Disable file logging when set to `true`/`1`                                    | No       |
@@ -141,6 +143,7 @@ curl -u "your-username:your-app-password" \
 ```
 
 1. **Atlassian API Key**: Put the Atlassian API Key in the `BITBUCKET_PASSWORD` variable, not `BITBUCKET_TOKEN`.
+1. **Different results than curl**: If curl with `-u username:app_password` returns more data than the tool, set `BITBUCKET_PREFER_BASIC=true` (or `BITBUCKET_AUTH_MODE=basic`) to force the same basic auth path instead of a lower-scope token.
 
 ### Getting Help
 
@@ -387,7 +390,11 @@ Lists comments on a pull request.
 - `repo_slug`: Repository slug
 - `pull_request_id`: Pull request ID
 - `page` (optional): Page number to fetch (Bitbucket paginates results)
-- `pagelen` (optional): Items per page (defaults to Bitbucket's 10; some endpoints allow up to 1000)
+- `pagelen` (optional): Items per page (Bitbucket default is 10; this tool defaults to 100 when not accumulating)
+- `limit` (optional): Maximum number of comments to return when accumulating pages
+- `accumulate` (optional): When true, follows `next` links to return all pages (or until `limit`). Defaults to true unless an explicit `page` is provided.
+- `unresolved` (optional): Filter by resolution state; `true` -> unresolved only, `false` -> resolved only
+- `onlyInline` (optional): Filter after fetch; `true` -> inline only, `false` -> non-inline only
 
 #### `addPullRequestComment`
 

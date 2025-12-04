@@ -601,16 +601,30 @@ class BitbucketServer {
       );
     }
 
+    const authModeEnv = (process.env.BITBUCKET_AUTH_MODE || "").toLowerCase();
+    const preferBasicEnv = isTruthyEnv(process.env.BITBUCKET_PREFER_BASIC);
+    const preferBasic = preferBasicEnv || authModeEnv === "basic";
+    const useBasic =
+      this.config.username &&
+      this.config.password &&
+      (preferBasic || !this.config.token || authModeEnv === "basic");
+    const useToken = this.config.token && !useBasic;
+
+    logger.info("Bitbucket auth mode", {
+      mode: useBasic ? "basic" : useToken ? "token" : "none",
+      preferBasic,
+      authModeEnv,
+    });
+
     // Setup Axios instance
     this.api = axios.create({
       baseURL: this.config.baseUrl,
-      headers: this.config.token
+      headers: useToken
         ? { Authorization: `Bearer ${this.config.token}` }
         : { "Content-Type": "application/json" },
-      auth:
-        this.config.username && this.config.password
-          ? { username: this.config.username, password: this.config.password }
-          : undefined,
+      auth: useBasic
+        ? { username: this.config.username!, password: this.config.password! }
+        : undefined,
     });
 
     // Setup tool handlers using the request handler pattern
@@ -905,10 +919,25 @@ class BitbucketServer {
                 description:
                   "Optional page length (items per page). Bitbucket default is 10 and allows up to 1000 on some endpoints.",
               },
+              limit: {
+                type: "number",
+                description:
+                  "Optional overall max number of comments to return when accumulating pages.",
+              },
               accumulate: {
                 type: "boolean",
                 description:
                   "Follow pagination automatically to return all comments. Defaults to true when no explicit page is provided.",
+              },
+              unresolved: {
+                type: "boolean",
+                description:
+                  "Filter by resolution state: true -> unresolved only, false -> resolved only, omit for all",
+              },
+              onlyInline: {
+                type: "boolean",
+                description:
+                  "Filter inline vs general comments after fetch. true -> inline only, false -> non-inline only, omit for all",
               },
             },
             required: ["workspace", "repo_slug", "pull_request_id"],
@@ -2050,7 +2079,11 @@ class BitbucketServer {
               args.pull_request_id as string,
               args.page as number | undefined,
               args.pagelen as number | undefined,
-              args.accumulate as boolean | undefined
+              args.limit as number | undefined,
+              args.limit as number | undefined,
+              args.accumulate as boolean | undefined,
+              args.unresolved as boolean | undefined,
+              args.onlyInline as boolean | undefined
             );
           case "getPullRequestDiff":
             return await this.getPullRequestDiff(
@@ -2860,7 +2893,10 @@ class BitbucketServer {
     pull_request_id: string,
     page?: number,
     pagelen?: number,
-    accumulate?: boolean
+    limit?: number,
+    accumulate?: boolean,
+    unresolved?: boolean,
+    onlyInline?: boolean
   ) {
     try {
       logger.info("Getting Bitbucket pull request comments", {
@@ -2869,28 +2905,38 @@ class BitbucketServer {
         pull_request_id,
         page,
         pagelen,
+
+        limit,
         accumulate,
+        unresolved,
+        onlyInline,
       });
 
-      // Bitbucket caps pagelen at 100 for this endpoint; clamp to stay under 400 errors
-      const resolvedPagelen = (() => {
-        if (typeof pagelen === "number" && isFinite(pagelen) && pagelen > 0) {
-          return Math.min(100, Math.floor(pagelen));
+      const clampPagelen = (value?: number) => {
+        if (typeof value === "number" && isFinite(value) && value > 0) {
+          return Math.min(100, Math.floor(value));
         }
         return 100;
-      })();
+      };
 
-      // If the caller supplied an explicit page, respect it and do a single request.
-      // Otherwise, accumulate all pages by default (unless explicitly disabled).
-      const shouldAccumulate =
-        accumulate !== undefined
-          ? accumulate
-          : typeof page !== "number" || !isFinite(page);
+      const filterComments = (comments: any[]) =>
+        comments.filter((c) => {
+          if (unresolved === true && c?.resolved === true) return false;
+          if (unresolved === false && c?.resolved !== true) return false;
+          if (onlyInline === true && !c?.inline) return false;
+          if (onlyInline === false && c?.inline) return false;
+          return true;
+        });
 
-      const allComments: any[] = [];
+      const hasExplicitPage = typeof page === "number" && isFinite(page);
+      let shouldAccumulate =
+        accumulate !== undefined ? accumulate : !hasExplicitPage;
+      if (typeof limit === "number" && limit > 0) shouldAccumulate = true;
+
+      const resolvedPagelen = clampPagelen(pagelen);
+      const collected: any[] = [];
       let nextUrl: string | undefined;
-      let currentPage =
-        typeof page === "number" && isFinite(page) ? page : 1;
+      let currentPage = hasExplicitPage ? Number(page) : 1;
       let fetchCount = 0;
 
       do {
@@ -2899,7 +2945,6 @@ class BitbucketServer {
           pagelen: resolvedPagelen,
         };
 
-        // Use absolute "next" URLs when provided to preserve any server-chosen cursors/filters
         const response = nextUrl
           ? await this.api.get(nextUrl)
           : await this.api.get(
@@ -2907,45 +2952,86 @@ class BitbucketServer {
               { params }
             );
 
-        const values = Array.isArray(response.data.values)
+        const values: any[] = Array.isArray(response.data?.values)
           ? response.data.values
           : [];
-        allComments.push(...values);
 
-        fetchCount += 1;
+        if (shouldAccumulate) {
+          collected.push(...values);
+          if (
+            typeof limit === "number" &&
+            limit > 0 &&
+            collected.length >= limit
+          ) {
+            break;
+          }
+        } else {
+          const filteredSingle = filterComments(values);
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  {
+                    meta: {
+                      accumulated: false,
+                      returned: filteredSingle.length,
+                      limit: limit ?? null,
+                      page: currentPage,
+                      pagelen: resolvedPagelen,
+                      pages: 1,
+                      has_more:
+                        typeof response.data?.next === "string" ? true : false,
+                    },
+                    comments: filteredSingle,
+                  },
+                  null,
+                  2
+                ),
+              },
+            ],
+          };
+        }
+
         nextUrl =
-          shouldAccumulate && typeof response.data.next === "string"
+          shouldAccumulate && typeof response.data?.next === "string"
             ? response.data.next
             : undefined;
 
         if (nextUrl) {
-          // Bitbucket "next" already encodes cursor/page; derive page when present, otherwise increment defensively
           const nextPageMatch = nextUrl.match(/[?&]page=(\d+)/);
           currentPage = nextPageMatch ? Number(nextPageMatch[1]) : currentPage + 1;
         }
 
-        // Safety valve to avoid accidental infinite loops
+        fetchCount += 1;
         if (fetchCount > 500) {
           throw new Error(
             "Pagination aborted after 500 pages to prevent infinite loop"
           );
         }
-      } while (nextUrl);
+      } while (shouldAccumulate && nextUrl);
+
+      const sliced =
+        typeof limit === "number" && limit > 0
+          ? collected.slice(0, limit)
+          : collected;
+      const filtered = filterComments(sliced);
+
+      const meta = {
+        accumulated: shouldAccumulate,
+        returned: filtered.length,
+        limit: limit ?? null,
+        page: hasExplicitPage ? page : null,
+        pagelen: resolvedPagelen,
+        pages: fetchCount || 1,
+        has_more: Boolean(nextUrl),
+      };
 
       return {
         content: [
           {
             type: "text",
-            text: JSON.stringify(
-              {
-                count: allComments.length,
-                pages: fetchCount,
-                pagelen: resolvedPagelen,
-                comments: allComments,
-              },
-              null,
-              2
-            ),
+            text: JSON.stringify({ meta, comments: filtered }, null, 2),
           },
         ],
       };
